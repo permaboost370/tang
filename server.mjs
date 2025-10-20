@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
-import { Bot, webhookCallback, InputFile } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import sharp from 'sharp';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -41,6 +41,7 @@ const FIXED_PROMPT =
 
 /* ------------------------------- App Setup -------------------------------- */
 const app = express();
+// Telegram sends JSON updates
 app.use(express.json({ limit: '25mb' }));
 
 /* ------------------------------- Utilities -------------------------------- */
@@ -81,7 +82,7 @@ async function normalizeToSquare(buf, size) {
   return await img.extract({ left, top, width: side, height: side }).resize(size, size).png().toBuffer();
 }
 
-// Load logo PNG (from remote) with simple cache
+// Load logo PNG (remote) with simple cache
 let _logoCache = null;
 async function getLogoBuffer() {
   if (_logoCache) return _logoCache;
@@ -190,7 +191,7 @@ async function openaiBlendMascotHTTP({ draftPngBuf, maskPngBuf, prompt, size }) 
   form.append('prompt', prompt);
   form.append('size', `${size}x${size}`);
   form.append('n', '1');
-  // form.append('response_format', 'b64_json'); // removed: no longer accepted
+  // form.append('response_format', 'b64_json'); // removed: not accepted
   form.append('image', draftPngBuf, { filename: 'base.png', contentType: 'image/png' });
   form.append('mask',  maskPngBuf,  { filename: 'mask.png', contentType: 'image/png' });
 
@@ -284,20 +285,26 @@ bot.on('message:photo', async (ctx) => {
   }
 });
 
-/* ------------------------------- Webhook/HTTP ------------------------------ */
-// Correct grammY signature: adapter name 'express' + options object
-const handler = webhookCallback(
-  bot,
-  'express',
-  {
-    secretToken: TELEGRAM_SECRET_TOKEN || undefined,
-    webhookReply: false,
-    timeoutMilliseconds: 10000
+/* --------------------------- Early-ACK Webhook ---------------------------- */
+/**
+ * We return 200 OK immediately so Telegram never retries,
+ * then process the update in the background.
+ */
+app.post('/webhook/tg', async (req, res) => {
+  // Optional: reject if a secret is configured and header mismatches
+  if (TELEGRAM_SECRET_TOKEN && req.get('x-telegram-bot-api-secret-token') !== TELEGRAM_SECRET_TOKEN) {
+    return res.status(401).send('Unauthorized');
   }
-);
+  // Acknowledge right away
+  res.status(200).send('OK');
 
-// Mount middleware directly; grammY handles secret token check internally
-app.post('/webhook/tg', handler);
+  try {
+    // Process asynchronously after response is closed
+    await bot.handleUpdate(req.body, req);
+  } catch (e) {
+    console.error('[handleUpdate error]', e);
+  }
+});
 
 app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT, () => console.log('Bot listening on :' + PORT));
