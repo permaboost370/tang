@@ -70,7 +70,7 @@ async function normalizeToSquare(buf, size = SIZE) {
 }
 
 /* ------------------------------- Fixed Prompt ------------------------------ */
-// Safer, single prompt (users don't type prompts)
+
 const FIXED_PROMPT =
 `You are editing a user’s profile photo using two inputs:
 1) Main photo (first image).
@@ -86,48 +86,44 @@ Task:
 - No extra text or additional logos. Output a single square PNG.`;
 
 /* ------------------------------ AI Integration ----------------------------- */
-// Requests explicit PNG response; logs first KB of non-image replies; tries a backup model.
+// No generationConfig to avoid INVALID_ARGUMENT error
 async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size = SIZE }) {
   const userB64 = userJpegBuf.toString('base64');
   const logoB64 = logoPngBuf.toString('base64');
 
   const modelCandidates = [
     'gemini-2.5-flash-image',
-    'gemini-2.0-flash', // backup that often accepts image parts too
+    'gemini-2.0-flash', // backup model
   ];
 
   for (const model of modelCandidates) {
     const body = {
       model,
-      generationConfig: {
-        output_mime_type: 'image/png',
-      },
       contents: [{
         role: 'user',
         parts: [
           { text: prompt },
-          { inline_data: { mime_type: 'image/jpeg', data: userB64 } }, // main photo
-          { inline_data: { mime_type: 'image/png',  data: logoB64 } }, // logo-cat
-        ],
-      }],
+          { inline_data: { mime_type: 'image/jpeg', data: userB64 } }, // user photo
+          { inline_data: { mime_type: 'image/png', data: logoB64 } }   // logo-cat
+        ]
+      }]
     };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
 
     const json = await resp.json();
 
-    const imgPart = json?.candidates?.[0]?.content?.parts?.find(
-      p => p?.inline_data?.mime_type?.startsWith('image/')
-    );
+    const imgPart =
+      json?.candidates?.[0]?.content?.parts?.find(p => p?.inline_data?.mime_type?.startsWith('image/'));
 
     if (!imgPart?.inline_data?.data) {
       console.warn('[Gemini response - no image from]', model, JSON.stringify(json).slice(0, 1200));
-      continue; // try the next model
+      continue; // try next model
     }
 
     const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
@@ -137,16 +133,17 @@ async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size = SIZE })
       .toBuffer();
   }
 
-  return null; // signal fallback
+  return null; // if all models fail
 }
 
 /* --------------------------- Smarter Fallback Stamp ------------------------ */
+
 function pickAnchor(W, H, stickerW, stickerH, pad) {
   const anchors = [
     { name: 'bottom-right', left: W - stickerW - pad, top: H - stickerH - pad },
-    { name: 'bottom-left',  left: pad,                top: H - stickerH - pad },
-    { name: 'top-right',    left: W - stickerW - pad, top: pad },
-    { name: 'top-left',     left: pad,                top: pad },
+    { name: 'bottom-left', left: pad, top: H - stickerH - pad },
+    { name: 'top-right', left: W - stickerW - pad, top: pad },
+    { name: 'top-left', left: pad, top: pad }
   ];
   return anchors[Math.floor(Math.random() * anchors.length)];
 }
@@ -155,7 +152,6 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
   const base = await sharp(userJpegOrPng).resize(size, size).png().toBuffer();
   const W = size, H = size;
 
-  // Reasonable random scale (18–24% of width)
   const stickerW = Math.round(W * (0.18 + Math.random() * 0.06));
   const logo = await sharp(logoPng).resize({ width: stickerW }).png().toBuffer();
   const { width: lw = stickerW, height: lh = stickerW } = await sharp(logo).metadata();
@@ -163,22 +159,20 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
   const pad = Math.round(W * 0.035);
   const anchor = pickAnchor(W, H, lw, lh, pad);
 
-  // Small rotation for personality
-  const rotateDeg = (Math.random() * 10 - 5); // -5..+5 degrees
+  const rotateDeg = (Math.random() * 10 - 5);
   const rotated = await sharp(logo)
     .rotate(rotateDeg, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
     .png()
     .toBuffer();
   const metaR = await sharp(rotated).metadata();
 
-  // Soft contact shadow shaped like the sticker
   const shadow = await sharp({
     create: {
       width: metaR.width || lw,
       height: metaR.height || lh,
       channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    },
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    }
   })
     .composite([{ input: rotated, blend: 'dest-in' }])
     .blur(6)
@@ -187,8 +181,8 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
 
   return await sharp(base)
     .composite([
-      { input: shadow,  left: anchor.left + 6, top: anchor.top + 6, opacity: 0.35, blend: 'over' },
-      { input: rotated, left: anchor.left,     top: anchor.top,     blend: 'over' },
+      { input: shadow, left: anchor.left + 6, top: anchor.top + 6, opacity: 0.35, blend: 'over' },
+      { input: rotated, left: anchor.left, top: anchor.top, blend: 'over' }
     ])
     .png({ compressionLevel: 9 })
     .toBuffer();
@@ -199,7 +193,7 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
 bot.command('start', ctx =>
-  ctx.reply('Send me your PFP as a photo. I’ll add our logo-cat in a funny way and send it back!'),
+  ctx.reply('Send me your PFP as a photo. I’ll add our logo-cat in a funny way and send it back!')
 );
 
 bot.on('message:photo', async (ctx) => {
@@ -210,27 +204,22 @@ bot.on('message:photo', async (ctx) => {
     const fileId = photos?.[photos.length - 1]?.file_id;
     if (!fileId) return ctx.reply('Could not read that image.');
 
-    // 1) Download user photo
     const fileUrl = await tgGetFileUrl(fileId);
     const original = await fetchBuffer(fileUrl);
-
-    // 2) Normalize + load logo
     const userNorm = await normalizeToSquare(original, SIZE);
-    const logoBuf  = await getLogoBuffer();
+    const logoBuf = await getLogoBuffer();
 
-    // 3) Try AI
     const aiOut = await aiInsertLogoCat({
       userJpegBuf: userNorm,
-      logoPngBuf : logoBuf,
-      prompt     : FIXED_PROMPT,
-      size       : SIZE,
+      logoPngBuf: logoBuf,
+      prompt: FIXED_PROMPT,
+      size: SIZE
     });
 
-    // 4) Fallback (guaranteed result)
     const finalOut = aiOut || await fallbackOverlay(userNorm, logoBuf, SIZE);
 
     await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
-      caption: aiOut ? 'Your logo-cat PFP 😺✨' : 'AI was shy — here’s a sticker version 😺✨',
+      caption: aiOut ? 'Your logo-cat PFP 😺✨' : 'AI was shy — here’s a sticker version 😺✨'
     });
   } catch (err) {
     console.error(err);
@@ -241,7 +230,7 @@ bot.on('message:photo', async (ctx) => {
 /* ------------------------------- Webhook/HTTP ------------------------------ */
 
 const handler = webhookCallback(bot, 'express', {
-  secretToken: TELEGRAM_SECRET_TOKEN || undefined,
+  secretToken: TELEGRAM_SECRET_TOKEN || undefined
 });
 
 app.post('/webhook/tg', (req, res) => {
@@ -252,5 +241,4 @@ app.post('/webhook/tg', (req, res) => {
 });
 
 app.get('/', (_, res) => res.send('OK'));
-
 app.listen(PORT, () => console.log('Bot listening on :' + PORT));
