@@ -53,6 +53,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
     clearTimeout(t);
   }
 }
+
 async function fetchBuffer(url, timeoutMs = 30000) {
   const resp = await fetchWithTimeout(url, {}, timeoutMs);
   if (!resp.ok) throw new Error(`Failed to fetch buffer: ${resp.status} ${resp.statusText}`);
@@ -80,7 +81,7 @@ async function normalizeToSquare(buf, size) {
   return await img.extract({ left, top, width: side, height: side }).resize(size, size).png().toBuffer();
 }
 
-// Load logo PNG (from remote)
+// Load logo PNG (from remote) with simple cache
 let _logoCache = null;
 async function getLogoBuffer() {
   if (_logoCache) return _logoCache;
@@ -88,24 +89,22 @@ async function getLogoBuffer() {
   return _logoCache;
 }
 
-// Deterministic placement with slight randomness based on image hash-ish
+// Deterministic-ish placement
 function pickCornerRotation(width, height) {
   const corners = [
-    { name: 'tl', left: 0,             top: 0,              anchor: 'nw' },
-    { name: 'tr', left: width,        top: 0,              anchor: 'ne' },
-    { name: 'bl', left: 0,             top: height,         anchor: 'sw' },
-    { name: 'br', left: width,        top: height,         anchor: 'se' },
+    { name: 'tl', left: 0,        top: 0,         anchor: 'nw' },
+    { name: 'tr', left: width,    top: 0,         anchor: 'ne' },
+    { name: 'bl', left: 0,        top: height,    anchor: 'sw' },
+    { name: 'br', left: width,    top: height,    anchor: 'se' },
   ];
-  // Simple pseudo-random choice
   const idx = Math.floor(Math.random() * corners.length);
-  const rot = (Math.random() * 14) - 7; // -7..+7 degrees
+  const rot = (Math.random() * 14) - 7; // -7..+7 deg
   return { ...corners[idx], rotation: rot };
 }
 
 async function placeMascotDraft(baseBuf, logoBuf, size) {
-  // scale mascot to ~28% of image width
+  // scale mascot to ~28% of width
   const scale = Math.max(0.22, Math.min(0.32, 0.28 + (Math.random() - 0.5) * 0.06));
-  const logo = sharp(logoBuf).png();
   const base = sharp(baseBuf).png();
 
   const { width, height } = await base.metadata();
@@ -118,15 +117,17 @@ async function placeMascotDraft(baseBuf, logoBuf, size) {
 
   const corner = pickCornerRotation(width || size, height || size);
 
-  // Compute placement rectangle
   const margin = Math.floor((width || size) * 0.05);
   let left = margin, top = margin;
   if (corner.name === 'tr') left = (width || size) - lrW - margin;
   if (corner.name === 'br') { left = (width || size) - lrW - margin; top = (height || size) - lrH - margin; }
   if (corner.name === 'bl') top = (height || size) - lrH - margin;
 
-  // Slight rotation composite with shadow
-  const rotated = await sharp(logoResized).rotate(corner.rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toBuffer();
+  const rotated = await sharp(logoResized)
+    .rotate(corner.rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+
   const rotMeta = await sharp(rotated).metadata();
   const rw = rotMeta.width || lrW;
   const rh = rotMeta.height || lrH;
@@ -147,7 +148,7 @@ async function placeMascotDraft(baseBuf, logoBuf, size) {
     .png()
     .toBuffer();
 
-  // Build mask with a padded transparent hole where the mascot is
+  // Mask: solid except a transparent hole around mascot (+ padding)
   const padPx = Math.floor(Math.max(rw, rh) * 0.06);
   const rect = { left, top, w: rw, h: rh };
 
@@ -156,7 +157,7 @@ async function placeMascotDraft(baseBuf, logoBuf, size) {
       width: size,
       height: size,
       channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 1 } // keep
+      background: { r: 0, g: 0, b: 0, alpha: 1 } // keep region
     }
   }).png().toBuffer();
 
@@ -180,10 +181,10 @@ async function placeMascotDraft(baseBuf, logoBuf, size) {
   return { composited, mask: finalMask };
 }
 
+/* --------------------------- OpenAI Images Edit --------------------------- */
 async function openaiBlendMascotHTTP({ draftPngBuf, maskPngBuf, prompt, size }) {
   if (!USE_OPENAI) return null;
 
-  // Build multipart
   const form = new FormData();
   form.append('model', 'gpt-image-1');
   form.append('prompt', prompt);
@@ -247,10 +248,10 @@ bot.on('message:photo', async (ctx) => {
       getLogoBuffer()
     ]);
 
-    // 2) Local draft + mask
+    // 2) Local draft + mask (AI size)
     const { composited: draftFull, mask } = await placeMascotDraft(userNormAI, logoBuf, AI_IN_SIZE);
 
-    // 3) Try OpenAI blend with short window; then second attempt; else fallback
+    // 3) Try OpenAI blend (two short attempts), else fallback
     let finalOut = null;
     if (USE_OPENAI) {
       const tryOnce = () => openaiBlendMascotHTTP({
@@ -265,7 +266,7 @@ bot.on('message:photo', async (ctx) => {
       }
     }
 
-    // 4) If OpenAI blending didn’t return, fall back to high-res sticker composite
+    // 4) Fallback: high-res local sticker composite
     if (!finalOut) {
       const { composited } = await placeMascotDraft(userNormOut, logoBuf, SIZE);
       finalOut = composited;
@@ -284,22 +285,19 @@ bot.on('message:photo', async (ctx) => {
 });
 
 /* ------------------------------- Webhook/HTTP ------------------------------ */
+// Correct grammY signature: adapter name 'express' + options object
 const handler = webhookCallback(
   bot,
+  'express',
   {
     secretToken: TELEGRAM_SECRET_TOKEN || undefined,
     webhookReply: false,
     timeoutMilliseconds: 10000
-  },
-  'return' // end HTTP request on timeout; keep processing the update
+  }
 );
 
-app.post('/webhook/tg', (req, res) => {
-  if (TELEGRAM_SECRET_TOKEN && req.get('x-telegram-bot-api-secret-token') !== TELEGRAM_SECRET_TOKEN) {
-    return res.status(401).send('Unauthorized');
-  }
-  return handler(req, res);
-});
+// Mount middleware directly; grammY handles secret token check internally
+app.post('/webhook/tg', handler);
 
 app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT, () => console.log('Bot listening on :' + PORT));
