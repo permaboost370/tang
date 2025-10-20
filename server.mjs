@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import OpenAI from 'openai';
 
 /* ----------------------------- Global Handlers ---------------------------- */
 process.on('unhandledRejection', (reason) => console.error('[unhandledRejection]', reason));
@@ -16,19 +17,22 @@ process.on('uncaughtException',  (err)    => console.error('[uncaughtException]'
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_SECRET_TOKEN,
-  GEMINI_API_KEY,
   LOGO_CAT_URL,
+  OPENAI_API_KEY,
+  PROVIDER = '',
   OUTPUT_SIZE = '1024',
-  AI_INPUT_SIZE = '640',   // smaller image sent to AI to reduce tokens/latency
+  AI_INPUT_SIZE = '640',     // smaller image for AI (speed)
   PORT = 3000,
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
-if (!GEMINI_API_KEY) throw new Error('Missing GEMINI_API_KEY');
 if (!LOGO_CAT_URL) throw new Error('Missing LOGO_CAT_URL');
 
 const SIZE = parseInt(OUTPUT_SIZE, 10) || 1024;
 const AI_IN_SIZE = parseInt(AI_INPUT_SIZE, 10) || 640;
+
+const USE_OPENAI = (PROVIDER || '').toUpperCase() === 'OPENAI' && !!OPENAI_API_KEY;
+const openai = USE_OPENAI ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 /* ------------------------------- App Setup -------------------------------- */
 const app = express();
@@ -85,112 +89,121 @@ async function normalizeToSquare(buf, size) {
 
 /* ------------------------------- Fixed Prompt ------------------------------ */
 const FIXED_PROMPT =
-`You are editing a user’s profile photo using two inputs:
-1) Main photo (first image).
-2) Our plush "logo-cat" mascot (second image, transparent PNG).
+`You are editing a user’s profile photo.
+We already placed our plush "logo-cat" mascot into the image.
+Your task: subtly blend and harmonize the mascot with the scene—match lighting, add a natural contact shadow, and adjust edges so it looks integrated. 
+Do not remove, redraw, distort, or recolor the mascot. No text or extra logos. Keep a photoreal look. Output a single square PNG.`;
 
-Task:
-- Place the logo-cat INTO the scene in a playful, tasteful way that fits the context:
-  examples: peeking from the user’s shoulder, sitting on a hat, clinging to sunglasses,
-  balancing on an object, or photobombing from a pocket or edge of the frame.
-- Keep the mascot’s shape and colors faithful (do NOT redraw or deform it).
-- Do not cover more than 15% of the face. Preserve identity.
-- Match scene lighting and add a soft contact shadow so it feels grounded.
-- No extra text or additional logos. Output a single square PNG.`;
-
-/* ------------------------------ AI Integration ----------------------------- */
-async function callGeminiImage({ userJpegBuf, logoPngBuf, prompt, size }) {
-  const body = {
-    model: 'gemini-2.5-flash-image',
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { inline_data: { mime_type: 'image/jpeg', data: userJpegBuf.toString('base64') } },
-        { inline_data: { mime_type: 'image/png',  data: logoPngBuf.toString('base64') } }
-      ]
-    }]
-  };
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`;
-  const resp = await fetchWithTimeout(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  }, 25000);
-
-  const json = await resp.json();
-
-  // Quota/rate limit
-  if (json?.error?.status === 'RESOURCE_EXHAUSTED' || json?.error?.code === 429) {
-    console.warn('[Gemini quota]', json?.error?.message || json?.error);
-    return null;
-  }
-
-  // No image
-  const imgPart = json?.candidates?.[0]?.content?.parts?.find(p => p?.inline_data?.mime_type?.startsWith('image/'));
-  if (!imgPart?.inline_data?.data) {
-    console.warn('[Gemini response - no image]', JSON.stringify(json).slice(0, 1200));
-    return null;
-  }
-
-  const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
-  return sharp(aiBuf).resize(size, size, { fit: 'cover' }).png({ compressionLevel: 9 }).toBuffer();
-}
-
-// Try AI up to 25s, with a quick retry if we get a non-image finish reason
-async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size }) {
-  // attempt 1 (up to 12s)
-  const t1 = await Promise.race([
-    callGeminiImage({ userJpegBuf, logoPngBuf, prompt, size }),
-    sleep(12000).then(() => null)
-  ]);
-  if (t1) return t1;
-
-  // brief backoff then attempt 2 (up to 12s)
-  await sleep(1200);
-  const t2 = await Promise.race([
-    callGeminiImage({ userJpegBuf, logoPngBuf, prompt, size }),
-    sleep(12000).then(() => null)
-  ]);
-  return t2; // may be null; caller will fallback
-}
-
-/* --------------------------- Smarter Fallback Stamp ------------------------ */
+/* --------------------- Sticker Placement (deterministic) ------------------- */
 function pickAnchor(W, H, stickerW, stickerH, pad) {
   const anchors = [
-    { left: W - stickerW - pad, top: H - stickerH - pad },
-    { left: pad,                top: H - stickerH - pad },
-    { left: W - stickerW - pad, top: pad },
-    { left: pad,                top: pad }
+    { left: W - stickerW - pad, top: H - stickerH - pad }, // bottom-right
+    { left: pad,                top: H - stickerH - pad }, // bottom-left
+    { left: W - stickerW - pad, top: pad },                // top-right
+    { left: pad,                top: pad }                 // top-left
   ];
   return anchors[Math.floor(Math.random() * anchors.length)];
 }
-async function fallbackOverlay(userJpegOrPng, logoPng, size) {
-  const base = await sharp(userJpegOrPng).resize(size, size).png().toBuffer();
+
+/**
+ * Returns { composited, rect }
+ * - composited: Buffer PNG with mascot placed
+ * - rect: { left, top, w, h } — placement rect (used to generate mask for OpenAI)
+ */
+async function placeMascotDraft(userBuf, logoBuf, size) {
+  const base = await sharp(userBuf).resize(size, size).png().toBuffer();
   const W = size, H = size;
 
-  const stickerW = Math.round(W * (0.18 + Math.random() * 0.06));
-  const logo = await sharp(logoPng).resize({ width: stickerW }).png().toBuffer();
+  const stickerW = Math.round(W * (0.20 + Math.random() * 0.05)); // 20–25% width
+  const logo = await sharp(logoBuf).resize({ width: stickerW }).png().toBuffer();
   const { width: lw = stickerW, height: lh = stickerW } = await sharp(logo).metadata();
 
   const pad = Math.round(W * 0.035);
   const anchor = pickAnchor(W, H, lw, lh, pad);
-
   const rotateDeg = (Math.random() * 10 - 5);
-  const rotated = await sharp(logo).rotate(rotateDeg, { background: { r:0,g:0,b:0,alpha:0 } }).png().toBuffer();
+
+  // Rotate mascot
+  const rotated = await sharp(logo)
+    .rotate(rotateDeg, { background: { r:0, g:0, b:0, alpha:0 } })
+    .png()
+    .toBuffer();
   const metaR = await sharp(rotated).metadata();
+  const rect = { left: anchor.left, top: anchor.top, w: metaR.width || lw, h: metaR.height || lh };
 
+  // Soft contact shadow
   const shadow = await sharp({
-    create: { width: metaR.width || lw, height: metaR.height || lh, channels: 4, background: { r:0,g:0,b:0,alpha:0 } }
-  }).composite([{ input: rotated, blend: 'dest-in' }]).blur(6).png().toBuffer();
+    create: { width: rect.w, height: rect.h, channels: 4, background: { r:0,g:0,b:0,alpha:0 } }
+  })
+  .composite([{ input: rotated, blend: 'dest-in' }])
+  .blur(6)
+  .png()
+  .toBuffer();
 
-  return sharp(base)
+  const composited = await sharp(base)
     .composite([
-      { input: shadow,  left: anchor.left + 6, top: anchor.top + 6, opacity: 0.35, blend: 'over' },
-      { input: rotated, left: anchor.left,     top: anchor.top,     blend: 'over' }
+      { input: shadow,  left: rect.left + 6, top: rect.top + 6, opacity: 0.35, blend: 'over' },
+      { input: rotated, left: rect.left,     top: rect.top,     blend: 'over' }
     ])
     .png({ compressionLevel: 9 })
     .toBuffer();
+
+  return { composited, rect };
+}
+
+/* ------------------------- Mask for OpenAI Image Edits --------------------- */
+// Mask semantics for OpenAI: transparent = editable area, opaque = keep
+async function makeRectMask(width, height, rect, padPx = 10) {
+  const mask = await sharp({
+    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 1 } } // keep
+  }).png().toBuffer();
+
+  const hole = await sharp({
+    create: {
+      width: Math.max(1, rect.w + padPx * 2),
+      height: Math.max(1, rect.h + padPx * 2),
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 } // editable region
+    }
+  }).png().toBuffer();
+
+  const left = Math.max(0, rect.left - padPx);
+  const top  = Math.max(0, rect.top  - padPx);
+
+  return sharp(mask)
+    .composite([{ input: hole, left, top }])
+    .png()
+    .toBuffer();
+}
+
+/* ------------------------------ OpenAI Blending ---------------------------- */
+/**
+ * Takes the draft (with mascot placed) + mask around the mascot,
+ * asks OpenAI to *blend* lighting/shadows/edges, keeping mascot intact.
+ */
+async function openaiBlendMascot({ draftPngBuf, maskPngBuf, prompt, size }) {
+  if (!openai) return null;
+
+  try {
+    // NOTE: openai.images.edits expects multipart with "image" (base) + optional "mask"
+    // The SDK handles base64/multipart for us when passing Buffers.
+    const resp = await openai.images.edits({
+      model: 'gpt-image-1',
+      prompt,
+      image: draftPngBuf,      // base image (PNG/JPEG)
+      mask : maskPngBuf,       // transparent area => editable region
+      size : `${size}x${size}`,
+      n    : 1,
+      response_format: 'b64_json'
+    });
+
+    const b64 = resp?.data?.[0]?.b64_json;
+    if (!b64) return null;
+    const out = Buffer.from(b64, 'base64');
+    return await sharp(out).resize(size, size).png().toBuffer();
+  } catch (e) {
+    console.warn('[OpenAI edits error]', e?.response?.data || e?.message || e);
+    return null;
+  }
 }
 
 /* --------------------------------- Bot ------------------------------------ */
@@ -212,32 +225,62 @@ bot.on('message:photo', async (ctx) => {
       return;
     }
 
+    // 1) Download + normalize
     const fileUrl = await tgGetFileUrl(fileId);
     const original = await fetchBuffer(fileUrl, 20000);
 
     const [userNormAI, userNormOut, logoBuf] = await Promise.all([
-      normalizeToSquare(original, AI_IN_SIZE),
-      normalizeToSquare(original, SIZE),
+      normalizeToSquare(original, AI_IN_SIZE), // small canvas (for speed in placement step)
+      normalizeToSquare(original, SIZE),       // full-size output
       getLogoBuffer()
     ]);
 
-    // Try AI up to ~25s total (2 attempts). Webhook already returned 200, so no timeout.
-    let aiOut = await aiInsertLogoCat({
-      userJpegBuf: userNormAI,
-      logoPngBuf : logoBuf,
-      prompt     : FIXED_PROMPT,
-      size       : SIZE
-    });
+    // 2) Deterministic placement (fast, always works)
+    const { composited: draftSmall, rect } = await placeMascotDraft(userNormAI, logoBuf, AI_IN_SIZE);
 
-    const finalOut = aiOut || await fallbackOverlay(userNormOut, logoBuf, SIZE);
+    // 3) If OpenAI enabled, upscale draft to full size, make mask, and ask to blend
+    let finalOut = null;
+    if (USE_OPENAI) {
+      // Upscale draft to full output size for editing
+      const draftFull = await sharp(draftSmall).resize(SIZE, SIZE).png().toBuffer();
+
+      // Scale rect to full size
+      const scale = SIZE / AI_IN_SIZE;
+      const rectFull = {
+        left: Math.round(rect.left * scale),
+        top : Math.round(rect.top  * scale),
+        w   : Math.round(rect.w    * scale),
+        h   : Math.round(rect.h    * scale),
+      };
+      const mask = await makeRectMask(SIZE, SIZE, rectFull, 18);
+
+      // Give OpenAI up to ~20s total (two short attempts)
+      const tryOnce = () => openaiBlendMascot({
+        draftPngBuf: draftFull, maskPngBuf: mask, prompt: FIXED_PROMPT, size: SIZE
+      });
+
+      const ai1 = await Promise.race([ tryOnce(), sleep(12000).then(() => null) ]);
+      finalOut = ai1;
+      if (!finalOut) {
+        await sleep(1200);
+        const ai2 = await Promise.race([ tryOnce(), sleep(8000).then(() => null) ]);
+        finalOut = ai2;
+      }
+    }
+
+    // 4) If OpenAI blended output is not available, fall back to the high-res sticker version
+    if (!finalOut) {
+      // Re-place sticker on full-size for crisp output
+      const { composited } = await placeMascotDraft(userNormOut, logoBuf, SIZE);
+      finalOut = composited;
+    }
 
     await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
-      caption: aiOut ? 'Here’s your AI-placed logo-cat 😺✨' : 'AI was shy — here’s a quick sticker version 😺✨'
+      caption: USE_OPENAI ? 'Here’s your blended logo-cat 😺✨' : 'Here’s your logo-cat 😺✨'
     });
 
-    // clean up the waiting message
     try { await ctx.api.deleteMessage(ctx.chat.id, waitMsg.message_id); } catch {}
-    console.log('[webhook] done { ai:', !!aiOut, '}');
+    console.log('[webhook] done { blended:', !!USE_OPENAI, ' }');
   } catch (err) {
     console.error(err);
     try { await ctx.reply('Sorry, something went wrong. Try another photo.'); } catch {}
@@ -249,7 +292,7 @@ bot.on('message:photo', async (ctx) => {
 const handler = webhookCallback(bot, 'express', {
   secretToken: TELEGRAM_SECRET_TOKEN || undefined,
   webhookReply: false,
-  timeoutMilliseconds: 1500 // return 200 quickly
+  timeoutMilliseconds: 1500 // fast 200 OK
 });
 
 app.post('/webhook/tg', (req, res) => {
