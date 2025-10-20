@@ -6,13 +6,24 @@ import { Bot, webhookCallback, InputFile } from 'grammy';
 import sharp from 'sharp';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
+/* ----------------------------- Global Handlers ---------------------------- */
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
+/* --------------------------------- ENV ----------------------------------- */
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_SECRET_TOKEN,
   GEMINI_API_KEY,
   LOGO_CAT_URL,
   OUTPUT_SIZE = '1024',
+  AI_INPUT_SIZE = '768',    // optional: smaller image for AI to reduce latency/tokens
   PORT = 3000,
 } = process.env;
 
@@ -21,47 +32,65 @@ if (!GEMINI_API_KEY) throw new Error('Missing GEMINI_API_KEY');
 if (!LOGO_CAT_URL) throw new Error('Missing LOGO_CAT_URL');
 
 const SIZE = parseInt(OUTPUT_SIZE, 10) || 1024;
+const AI_IN_SIZE = parseInt(AI_INPUT_SIZE, 10) || 768;
 
+/* ------------------------------- App Setup -------------------------------- */
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
-/* --------------------------------- Helpers -------------------------------- */
+/* ------------------------------- Utilities -------------------------------- */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
 
-async function fetchBuffer(url) {
-  const r = await fetch(url);
+async function fetchBuffer(url, timeoutMs = 25000) {
+  const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status}`);
   return Buffer.from(await r.arrayBuffer());
 }
 
-// Support both remote URL and local file (LOGO_CAT_URL=file://assets/logo-cat.png)
+// Support remote URL or local file (LOGO_CAT_URL=file://assets/logo-cat.png)
+let LOGO_BUF_CACHE = null;
 async function getLogoBuffer() {
+  if (LOGO_BUF_CACHE) return LOGO_BUF_CACHE;
+
   const url = LOGO_CAT_URL;
   if (url.startsWith('file://')) {
     const rel = url.replace('file://', '');
     const full = path.join(process.cwd(), rel);
-    return await fs.readFile(full);
+    LOGO_BUF_CACHE = await fs.readFile(full);
+  } else {
+    LOGO_BUF_CACHE = await fetchBuffer(url, 20000);
   }
-  return await fetchBuffer(url);
+  return LOGO_BUF_CACHE;
 }
 
 async function tgGetFileUrl(fileId) {
-  const meta = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
+  const meta = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`,
+    {},
+    15000
   ).then(r => r.json());
   const filePath = meta?.result?.file_path;
   if (!filePath) throw new Error('Could not resolve Telegram file_path');
   return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 }
 
-// Square-crop & resize for stable AI results
-async function normalizeToSquare(buf, size = SIZE) {
-  const img = sharp(buf).rotate(); // auto-orient
+// Square-crop & resize for stable results
+async function normalizeToSquare(buf, size) {
+  const img = sharp(buf).rotate(); // auto-orient EXIF
   const meta = await img.metadata();
   const w = meta.width || size;
   const h = meta.height || size;
   const side = Math.min(w, h);
   const left = Math.floor((w - side) / 2);
-  const top = Math.floor((h - side) / 2);
+  const top  = Math.floor((h - side) / 2);
   return await img
     .extract({ left, top, width: side, height: side })
     .resize(size, size)
@@ -70,7 +99,6 @@ async function normalizeToSquare(buf, size = SIZE) {
 }
 
 /* ------------------------------- Fixed Prompt ------------------------------ */
-
 const FIXED_PROMPT =
 `You are editing a user’s profile photo using two inputs:
 1) Main photo (first image).
@@ -86,72 +114,70 @@ Task:
 - No extra text or additional logos. Output a single square PNG.`;
 
 /* ------------------------------ AI Integration ----------------------------- */
-// No generationConfig to avoid INVALID_ARGUMENT error
-async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size = SIZE }) {
+// Single image-capable model; clear 429 handling; guarded by timeout at call site.
+async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size }) {
   const userB64 = userJpegBuf.toString('base64');
   const logoB64 = logoPngBuf.toString('base64');
 
-  const modelCandidates = [
-    'gemini-2.5-flash-image',
-    'gemini-2.0-flash', // backup model
-  ];
+  const model = 'gemini-2.5-flash-image';
+  const body = {
+    model,
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: prompt },
+        { inline_data: { mime_type: 'image/jpeg', data: userB64 } }, // main photo
+        { inline_data: { mime_type: 'image/png',  data: logoB64 } }  // logo-cat
+      ]
+    }]
+  };
 
-  for (const model of modelCandidates) {
-    const body = {
-      model,
-      contents: [{
-        role: 'user',
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: 'image/jpeg', data: userB64 } }, // user photo
-          { inline_data: { mime_type: 'image/png', data: logoB64 } }   // logo-cat
-        ]
-      }]
-    };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const resp = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }, 22000);
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
+  const json = await resp.json();
 
-    const json = await resp.json();
-
-    const imgPart =
-      json?.candidates?.[0]?.content?.parts?.find(p => p?.inline_data?.mime_type?.startsWith('image/'));
-
-    if (!imgPart?.inline_data?.data) {
-      console.warn('[Gemini response - no image from]', model, JSON.stringify(json).slice(0, 1200));
-      continue; // try next model
-    }
-
-    const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
-    return await sharp(aiBuf)
-      .resize(size, size, { fit: 'cover' })
-      .png({ compressionLevel: 9 })
-      .toBuffer();
+  // Quota or throttling
+  if (json?.error?.status === 'RESOURCE_EXHAUSTED' || json?.error?.code === 429) {
+    console.warn('[Gemini quota]', json?.error?.message || json?.error);
+    return null;
   }
 
-  return null; // if all models fail
+  const imgPart = json?.candidates?.[0]?.content?.parts?.find(
+    p => p?.inline_data?.mime_type?.startsWith('image/')
+  );
+  if (!imgPart?.inline_data?.data) {
+    console.warn('[Gemini response - no image]', JSON.stringify(json).slice(0, 1200));
+    return null;
+  }
+
+  const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
+  return await sharp(aiBuf)
+    .resize(size, size, { fit: 'cover' })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
 }
 
 /* --------------------------- Smarter Fallback Stamp ------------------------ */
-
 function pickAnchor(W, H, stickerW, stickerH, pad) {
   const anchors = [
     { name: 'bottom-right', left: W - stickerW - pad, top: H - stickerH - pad },
-    { name: 'bottom-left', left: pad, top: H - stickerH - pad },
-    { name: 'top-right', left: W - stickerW - pad, top: pad },
-    { name: 'top-left', left: pad, top: pad }
+    { name: 'bottom-left',  left: pad,                top: H - stickerH - pad },
+    { name: 'top-right',    left: W - stickerW - pad, top: pad },
+    { name: 'top-left',     left: pad,                top: pad }
   ];
   return anchors[Math.floor(Math.random() * anchors.length)];
 }
 
-async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
+async function fallbackOverlay(userJpegOrPng, logoPng, size) {
   const base = await sharp(userJpegOrPng).resize(size, size).png().toBuffer();
   const W = size, H = size;
 
+  // 18–24% width
   const stickerW = Math.round(W * (0.18 + Math.random() * 0.06));
   const logo = await sharp(logoPng).resize({ width: stickerW }).png().toBuffer();
   const { width: lw = stickerW, height: lh = stickerW } = await sharp(logo).metadata();
@@ -159,7 +185,7 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
   const pad = Math.round(W * 0.035);
   const anchor = pickAnchor(W, H, lw, lh, pad);
 
-  const rotateDeg = (Math.random() * 10 - 5);
+  const rotateDeg = (Math.random() * 10 - 5); // slight personality
   const rotated = await sharp(logo)
     .rotate(rotateDeg, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
     .png()
@@ -189,7 +215,6 @@ async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
 }
 
 /* --------------------------------- Bot ------------------------------------ */
-
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
 bot.command('start', ctx =>
@@ -197,6 +222,8 @@ bot.command('start', ctx =>
 );
 
 bot.on('message:photo', async (ctx) => {
+  const t0 = Date.now();
+  console.log('[webhook] start', { chat: ctx.chat?.id, msg: ctx.message?.message_id });
   try {
     await ctx.api.sendChatAction(ctx.chat.id, 'upload_photo');
 
@@ -204,31 +231,52 @@ bot.on('message:photo', async (ctx) => {
     const fileId = photos?.[photos.length - 1]?.file_id;
     if (!fileId) return ctx.reply('Could not read that image.');
 
+    // 1) Download user photo
     const fileUrl = await tgGetFileUrl(fileId);
-    const original = await fetchBuffer(fileUrl);
-    const userNorm = await normalizeToSquare(original, SIZE);
-    const logoBuf = await getLogoBuffer();
+    const original = await fetchBuffer(fileUrl, 20000);
 
-    const aiOut = await aiInsertLogoCat({
-      userJpegBuf: userNorm,
-      logoPngBuf: logoBuf,
-      prompt: FIXED_PROMPT,
-      size: SIZE
-    });
+    // 2) Normalize (small for AI, full for output)
+    const [userNormAI, userNormOut, logoBuf] = await Promise.all([
+      normalizeToSquare(original, AI_IN_SIZE),
+      normalizeToSquare(original, SIZE),
+      getLogoBuffer()
+    ]);
 
-    const finalOut = aiOut || await fallbackOverlay(userNorm, logoBuf, SIZE);
+    // 3) Try AI with hard time limit so we never stall
+    const aiTimeoutMs = 20000; // 20s
+    let aiOut = null;
+    try {
+      const aiPromise = aiInsertLogoCat({
+        userJpegBuf: userNormAI,
+        logoPngBuf : logoBuf,
+        prompt     : FIXED_PROMPT,
+        size       : SIZE
+      });
+      const timeoutPromise = (async () => {
+        await sleep(aiTimeoutMs);
+        throw new Error(`AI timeout after ${aiTimeoutMs}ms`);
+      })();
+      aiOut = await Promise.race([aiPromise, timeoutPromise]);
+    } catch (e) {
+      console.warn('[AI skipped]', e?.message || e);
+    }
+
+    // 4) Guaranteed fast fallback
+    const finalOut = aiOut || await fallbackOverlay(userNormOut, logoBuf, SIZE);
 
     await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
       caption: aiOut ? 'Your logo-cat PFP 😺✨' : 'AI was shy — here’s a sticker version 😺✨'
     });
+
+    console.log('[webhook] done in', Date.now() - t0, 'ms', { ai: !!aiOut });
   } catch (err) {
     console.error(err);
+    console.log('[webhook] fail in', Date.now() - t0, 'ms');
     await ctx.reply('Sorry, I couldn’t process that image. Try another photo.');
   }
 });
 
 /* ------------------------------- Webhook/HTTP ------------------------------ */
-
 const handler = webhookCallback(bot, 'express', {
   secretToken: TELEGRAM_SECRET_TOKEN || undefined
 });
