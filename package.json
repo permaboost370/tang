@@ -1,17 +1,18 @@
 {
-  "name": "logo-cat-bot",
+  "name": "tang-pfp-bot",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Telegram PFP bot with OpenAI image blending",
   "main": "server.mjs",
+  "type": "module",
   "scripts": {
-    "dev": "node server.mjs",
     "start": "node server.mjs"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "grammy": "^1.27.0",
+    "grammy": "^1.24.1",
     "node-fetch": "^3.3.2",
-    "sharp": "^0.33.4"
+    "sharp": "^0.33.3",
+    "dotenv": "^16.4.5",
+    "openai": "^4.75.0"
   }
 }
