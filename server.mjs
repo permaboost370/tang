@@ -23,7 +23,7 @@ const {
   GEMINI_API_KEY,
   LOGO_CAT_URL,
   OUTPUT_SIZE = '1024',
-  AI_INPUT_SIZE = '768',    // optional: smaller image for AI to reduce latency/tokens
+  AI_INPUT_SIZE = '640',     // smaller image to AI (fewer tokens, faster)
   PORT = 3000,
 } = process.env;
 
@@ -32,7 +32,7 @@ if (!GEMINI_API_KEY) throw new Error('Missing GEMINI_API_KEY');
 if (!LOGO_CAT_URL) throw new Error('Missing LOGO_CAT_URL');
 
 const SIZE = parseInt(OUTPUT_SIZE, 10) || 1024;
-const AI_IN_SIZE = parseInt(AI_INPUT_SIZE, 10) || 768;
+const AI_IN_SIZE = parseInt(AI_INPUT_SIZE, 10) || 640;
 
 /* ------------------------------- App Setup -------------------------------- */
 const app = express();
@@ -114,7 +114,7 @@ Task:
 - No extra text or additional logos. Output a single square PNG.`;
 
 /* ------------------------------ AI Integration ----------------------------- */
-// Single image-capable model; clear 429 handling; guarded by timeout at call site.
+// Single image-capable model; clear 429 handling; guarded by 8s timeout at call site.
 async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size }) {
   const userB64 = userJpegBuf.toString('base64');
   const logoB64 = logoPngBuf.toString('base64');
@@ -137,7 +137,7 @@ async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size }) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
-  }, 22000);
+  }, 9000); // keep API call itself under ~9s
 
   const json = await resp.json();
 
@@ -147,6 +147,7 @@ async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size }) {
     return null;
   }
 
+  // No image returned
   const imgPart = json?.candidates?.[0]?.content?.parts?.find(
     p => p?.inline_data?.mime_type?.startsWith('image/')
   );
@@ -233,7 +234,7 @@ bot.on('message:photo', async (ctx) => {
 
     // 1) Download user photo
     const fileUrl = await tgGetFileUrl(fileId);
-    const original = await fetchBuffer(fileUrl, 20000);
+    const original = await fetchBuffer(fileUrl, 15000);
 
     // 2) Normalize (small for AI, full for output)
     const [userNormAI, userNormOut, logoBuf] = await Promise.all([
@@ -242,8 +243,8 @@ bot.on('message:photo', async (ctx) => {
       getLogoBuffer()
     ]);
 
-    // 3) Try AI with hard time limit so we never stall
-    const aiTimeoutMs = 20000; // 20s
+    // 3) Try AI with hard time limit (<= 8s) so webhook reply is always < 10s
+    const aiTimeoutMs = 8000;
     let aiOut = null;
     try {
       const aiPromise = aiInsertLogoCat({
@@ -277,8 +278,10 @@ bot.on('message:photo', async (ctx) => {
 });
 
 /* ------------------------------- Webhook/HTTP ------------------------------ */
+// IMPORTANT: keep timeoutMilliseconds < 10000 so Telegram doesn't time out
 const handler = webhookCallback(bot, 'express', {
-  secretToken: TELEGRAM_SECRET_TOKEN || undefined
+  secretToken: TELEGRAM_SECRET_TOKEN || undefined,
+  timeoutMilliseconds: 9000
 });
 
 app.post('/webhook/tg', (req, res) => {
