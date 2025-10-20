@@ -1,0 +1,17 @@
+{
+  "name": "logo-cat-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "grammy": "^1.27.0",
+    "node-fetch": "^3.3.2",
+    "sharp": "^0.33.4"
+  }
+}
