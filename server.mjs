@@ -1,4 +1,4 @@
-// server.mjs — Tang PFP (manual workflow) via webhook
+// server.mjs — Tang PFP (manual workflow) via webhook, with proper next() flow
 import 'dotenv/config';
 import express from 'express';
 import { Bot, webhookCallback } from 'grammy';
@@ -17,14 +17,12 @@ if (!ADMIN_CHAT_ID) throw new Error('Missing ADMIN_CHAT_ID (numeric)');
 if (!WEBHOOK_URL) throw new Error('Missing WEBHOOK_URL (e.g. https://.../webhook/tg)');
 
 /* ----------------------------- State ----------------------------- */
-// token -> job; adminMessageId -> token; adminChatId -> sticky token
-const jobsByToken = new Map();
-const tokensByAdminMsgId = new Map();
-const lastTokenByAdmin = new Map();
+const jobsByToken = new Map();        // token -> job
+const tokensByAdminMsgId = new Map(); // adminMessageId -> token
+const lastTokenByAdmin = new Map();   // adminChatId -> sticky token
 
 /* --------------------------- Helpers ----------------------------- */
 const isAdminChat = (id) => String(id) === String(ADMIN_CHAT_ID);
-
 const mkToken = () => 'JOB-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
 function fmtUser(ctx) {
@@ -33,25 +31,22 @@ function fmtUser(ctx) {
   const at = u.username ? `@${u.username}` : `(id:${u.id})`;
   return { id: u.id, name, at };
 }
-
 function getBestImageFileId(msg) {
   if (msg?.photo?.length) return msg.photo[msg.photo.length - 1].file_id; // largest photo
   if (msg?.document && (msg.document.mime_type || '').startsWith('image/')) return msg.document.file_id;
   return null;
 }
-
 function extractTokenFromText(s) {
   if (!s) return null;
   const m = s.match(/\bJOB-[A-F0-9]{6}\b/i);
   return m ? m[0].toUpperCase() : null;
 }
-
 const listOpenTokens = () => Array.from(jobsByToken.keys());
 
 /* ----------------------------- Bot ------------------------------ */
 const bot = new Bot(BOT_TOKEN);
 
-// Loud visibility
+// Visibility
 bot.use(async (ctx, next) => {
   const kind = ctx.update?.message ? 'message'
              : ctx.update?.edited_message ? 'edited_message'
@@ -110,7 +105,7 @@ bot.command('deliver', async (ctx) => {
   await ctx.reply(`Sticky token set to ${token}. Now send the image (no need to reply/caption).`);
 });
 
-// Send a test DM to admin to verify ADMIN_CHAT_ID is correct
+/* Diagnostic: verify admin DM works */
 bot.command('admintest', async (ctx) => {
   try {
     await bot.api.sendMessage(ADMIN_CHAT_ID, '✅ Admin DM works');
@@ -141,8 +136,7 @@ async function deliverToUser(ctx, token, finishedFileId) {
 }
 
 async function handleAdminMedia(ctx) {
-  if (!isAdminChat(ctx.chat.id)) return;
-
+  // This function is only called for ADMIN chat; see wrapper below.
   const msg = ctx.message;
   const fileId = getBestImageFileId(msg);
   if (!fileId) return; // ignore non-image
@@ -170,18 +164,29 @@ async function handleAdminMedia(ctx) {
   await ctx.reply('I couldn’t match this image to a job.\nReply to the job, include JOB-XXXXXX in caption, or /list then /deliver JOB-XXXXXX.');
 }
 
-bot.on('message:photo', handleAdminMedia);
-bot.on('message:document', handleAdminMedia);
-
-// Admin text can set sticky token by just sending the token
-bot.on('message:text', async (ctx) => {
-  if (!isAdminChat(ctx.chat.id)) return;
+/* -------- Register admin handlers with pass-through to next() -------- */
+// Photos
+bot.on('message:photo', async (ctx, next) => {
+  if (isAdminChat(ctx.chat.id)) return handleAdminMedia(ctx);
+  return next(); // IMPORTANT: allow user handlers to run
+});
+// Image documents
+bot.on('message:document', async (ctx, next) => {
+  const mime = ctx.message.document?.mime_type || '';
+  if (isAdminChat(ctx.chat.id) && mime.startsWith('image/')) return handleAdminMedia(ctx);
+  return next();
+});
+// Admin text for tokens (pass-through for non-admin)
+bot.on('message:text', async (ctx, next) => {
+  if (!isAdminChat(ctx.chat.id)) return next();
   const token = extractTokenFromText(ctx.message.text);
   if (token) {
     if (!jobsByToken.has(token)) return void ctx.reply(`Unknown token ${token}. Try /list.`);
     lastTokenByAdmin.set(ctx.chat.id, token);
     await ctx.reply(`Got token ${token}. Now send the finished image (no need to reply).`);
+    return; // handled
   }
+  return next();
 });
 
 /* ---------------------- User intake handlers --------------------- */
@@ -221,6 +226,7 @@ token: ${token}
   }
 }
 
+// Register user handlers AFTER admin wrappers so next() reaches here
 bot.on('message:photo', handleIncomingFromUser);
 bot.on('message:document', async (ctx) => {
   const mime = ctx.message.document?.mime_type || '';
@@ -252,7 +258,7 @@ app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT, async () => {
   console.log('HTTP server on :' + PORT);
   try {
-    // Clear any polling/webhook residue, then set webhook
+    // Clear any previous webhook/polling residue, then set webhook
     await bot.api.deleteWebhook({ drop_pending_updates: false });
     await bot.api.setWebhook(WEBHOOK_URL, TELEGRAM_SECRET_TOKEN ? { secret_token: TELEGRAM_SECRET_TOKEN } : {});
     console.log('[webhook] set to', WEBHOOK_URL, TELEGRAM_SECRET_TOKEN ? '(with secret)' : '');
