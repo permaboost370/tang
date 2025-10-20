@@ -1,8 +1,11 @@
+// server.mjs
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
 import { Bot, webhookCallback, InputFile } from 'grammy';
 import sharp from 'sharp';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -22,127 +25,212 @@ const SIZE = parseInt(OUTPUT_SIZE, 10) || 1024;
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
-// ---------- helpers ----------
+/* --------------------------------- Helpers -------------------------------- */
+
 async function fetchBuffer(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status}`);
   return Buffer.from(await r.arrayBuffer());
 }
 
+// Support both remote URL and local file (LOGO_CAT_URL=file://assets/logo-cat.png)
+async function getLogoBuffer() {
+  const url = LOGO_CAT_URL;
+  if (url.startsWith('file://')) {
+    const rel = url.replace('file://', '');
+    const full = path.join(process.cwd(), rel);
+    return await fs.readFile(full);
+  }
+  return await fetchBuffer(url);
+}
+
 async function tgGetFileUrl(fileId) {
-  const meta = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`).then(r => r.json());
-  const path = meta?.result?.file_path;
-  if (!path) throw new Error('Could not resolve Telegram file_path');
-  return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${path}`;
+  const meta = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
+  ).then(r => r.json());
+  const filePath = meta?.result?.file_path;
+  if (!filePath) throw new Error('Could not resolve Telegram file_path');
+  return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 }
 
 // Square-crop & resize for stable AI results
 async function normalizeToSquare(buf, size = SIZE) {
-  const img = sharp(buf).rotate();
+  const img = sharp(buf).rotate(); // auto-orient
   const meta = await img.metadata();
-  const w = meta.width || size, h = meta.height || size;
+  const w = meta.width || size;
+  const h = meta.height || size;
   const side = Math.min(w, h);
   const left = Math.floor((w - side) / 2);
-  const top  = Math.floor((h - side) / 2);
-  return await img.extract({ left, top, width: side, height: side }).resize(size, size).jpeg({ quality: 95 }).toBuffer();
+  const top = Math.floor((h - side) / 2);
+  return await img
+    .extract({ left, top, width: side, height: side })
+    .resize(size, size)
+    .jpeg({ quality: 95 })
+    .toBuffer();
 }
 
-// Fixed prompt (no user prompting)
+/* ------------------------------- Fixed Prompt ------------------------------ */
+// Safer, single prompt (users don't type prompts)
 const FIXED_PROMPT =
 `You are editing a user’s profile photo using two inputs:
 1) Main photo (first image).
-2) Our brand mascot "logo-cat" (second image, transparent PNG).
+2) Our plush "logo-cat" mascot (second image, transparent PNG).
 
 Task:
-- Place the logo-cat INTO the scene in a fun, tasteful way that fits context:
+- Place the logo-cat INTO the scene in a playful, tasteful way that fits the context:
   examples: peeking from the user’s shoulder, sitting on a hat, clinging to sunglasses,
-  balancing on an object, or photobombing from a pocket.
-- Keep logo-cat’s design/colors faithful. Do NOT redraw or deform it.
+  balancing on an object, or photobombing from a pocket or edge of the frame.
+- Keep the mascot’s shape and colors faithful (do NOT redraw or deform it).
 - Do not cover more than 15% of the face. Preserve identity.
-- Match scene lighting; add soft shadow/contact shadow so it feels grounded.
-- No additional text or logos. Output a single square PNG.`;
+- Match scene lighting and add a soft contact shadow so it feels grounded.
+- No extra text or additional logos. Output a single square PNG.`;
 
-// Call Gemini 2.5 Flash Image (img2img)
+/* ------------------------------ AI Integration ----------------------------- */
+// Requests explicit PNG response; logs first KB of non-image replies; tries a backup model.
 async function aiInsertLogoCat({ userJpegBuf, logoPngBuf, prompt, size = SIZE }) {
   const userB64 = userJpegBuf.toString('base64');
   const logoB64 = logoPngBuf.toString('base64');
 
-  const body = {
-    model: 'gemini-2.5-flash-image',
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { inline_data: { mime_type: 'image/jpeg', data: userB64 } },
-        { inline_data: { mime_type: 'image/png',  data: logoB64 } }
-      ]
-    }]
-  };
+  const modelCandidates = [
+    'gemini-2.5-flash-image',
+    'gemini-2.0-flash', // backup that often accepts image parts too
+  ];
 
-  const resp = await fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + GEMINI_API_KEY,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  const json = await resp.json();
+  for (const model of modelCandidates) {
+    const body = {
+      model,
+      generationConfig: {
+        output_mime_type: 'image/png',
+      },
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: 'image/jpeg', data: userB64 } }, // main photo
+          { inline_data: { mime_type: 'image/png',  data: logoB64 } }, // logo-cat
+        ],
+      }],
+    };
 
-  const imgPart = json?.candidates?.[0]?.content?.parts?.find(p => p?.inline_data?.mime_type?.startsWith('image/'));
-  if (!imgPart?.inline_data?.data) return null; // allow fallback
-  const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
-  return await sharp(aiBuf).resize(size, size, { fit: 'cover' }).png({ compressionLevel: 9 }).toBuffer();
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const json = await resp.json();
+
+    const imgPart = json?.candidates?.[0]?.content?.parts?.find(
+      p => p?.inline_data?.mime_type?.startsWith('image/')
+    );
+
+    if (!imgPart?.inline_data?.data) {
+      console.warn('[Gemini response - no image from]', model, JSON.stringify(json).slice(0, 1200));
+      continue; // try the next model
+    }
+
+    const aiBuf = Buffer.from(imgPart.inline_data.data, 'base64');
+    return await sharp(aiBuf)
+      .resize(size, size, { fit: 'cover' })
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+  }
+
+  return null; // signal fallback
 }
 
-// Fallback: sticker overlay bottom-right with soft shadow
+/* --------------------------- Smarter Fallback Stamp ------------------------ */
+function pickAnchor(W, H, stickerW, stickerH, pad) {
+  const anchors = [
+    { name: 'bottom-right', left: W - stickerW - pad, top: H - stickerH - pad },
+    { name: 'bottom-left',  left: pad,                top: H - stickerH - pad },
+    { name: 'top-right',    left: W - stickerW - pad, top: pad },
+    { name: 'top-left',     left: pad,                top: pad },
+  ];
+  return anchors[Math.floor(Math.random() * anchors.length)];
+}
+
 async function fallbackOverlay(userJpegOrPng, logoPng, size = SIZE) {
   const base = await sharp(userJpegOrPng).resize(size, size).png().toBuffer();
-  const W = size;
-  const stickerW = Math.round(W * 0.22);
-  const logo = await sharp(logoPng).resize({ width: stickerW }).png().toBuffer();
-  const meta = await sharp(logo).metadata();
-  const pad = Math.round(W * 0.03);
-  const left = W - (meta.width || stickerW) - pad;
-  const top  = W - (meta.height || stickerW) - pad;
+  const W = size, H = size;
 
+  // Reasonable random scale (18–24% of width)
+  const stickerW = Math.round(W * (0.18 + Math.random() * 0.06));
+  const logo = await sharp(logoPng).resize({ width: stickerW }).png().toBuffer();
+  const { width: lw = stickerW, height: lh = stickerW } = await sharp(logo).metadata();
+
+  const pad = Math.round(W * 0.035);
+  const anchor = pickAnchor(W, H, lw, lh, pad);
+
+  // Small rotation for personality
+  const rotateDeg = (Math.random() * 10 - 5); // -5..+5 degrees
+  const rotated = await sharp(logo)
+    .rotate(rotateDeg, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+  const metaR = await sharp(rotated).metadata();
+
+  // Soft contact shadow shaped like the sticker
   const shadow = await sharp({
-    create: { width: meta.width || stickerW, height: meta.height || stickerW, channels: 4, background: { r:0,g:0,b:0,alpha:0 } }
-  }).png().toBuffer();
-  const blurred = await sharp(shadow).composite([{ input: logo, blend: 'dest-in' }]).blur(5).toBuffer();
+    create: {
+      width: metaR.width || lw,
+      height: metaR.height || lh,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([{ input: rotated, blend: 'dest-in' }])
+    .blur(6)
+    .png()
+    .toBuffer();
 
   return await sharp(base)
     .composite([
-      { input: blurred, left: left + 6, top: top + 6, blend: 'over', opacity: 0.35 },
-      { input: logo, left, top, blend: 'over' }
+      { input: shadow,  left: anchor.left + 6, top: anchor.top + 6, opacity: 0.35, blend: 'over' },
+      { input: rotated, left: anchor.left,     top: anchor.top,     blend: 'over' },
     ])
-    .png({ compressionLevel: 9 }).toBuffer();
+    .png({ compressionLevel: 9 })
+    .toBuffer();
 }
 
-// ---------- bot ----------
+/* --------------------------------- Bot ------------------------------------ */
+
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
-bot.command('start', ctx => ctx.reply('Send me your PFP as a photo. I’ll add our logo-cat in a funny way and send it back!'));
+bot.command('start', ctx =>
+  ctx.reply('Send me your PFP as a photo. I’ll add our logo-cat in a funny way and send it back!'),
+);
 
 bot.on('message:photo', async (ctx) => {
   try {
     await ctx.api.sendChatAction(ctx.chat.id, 'upload_photo');
+
     const photos = ctx.message.photo;
     const fileId = photos?.[photos.length - 1]?.file_id;
     if (!fileId) return ctx.reply('Could not read that image.');
 
-    // 1) get user photo
+    // 1) Download user photo
     const fileUrl = await tgGetFileUrl(fileId);
     const original = await fetchBuffer(fileUrl);
 
-    // 2) normalize + fetch logo
+    // 2) Normalize + load logo
     const userNorm = await normalizeToSquare(original, SIZE);
-    const logoBuf  = await fetchBuffer(LOGO_CAT_URL);
+    const logoBuf  = await getLogoBuffer();
 
-    // 3) AI attempt
-    const aiOut = await aiInsertLogoCat({ userJpegBuf: userNorm, logoPngBuf: logoBuf, prompt: FIXED_PROMPT, size: SIZE });
+    // 3) Try AI
+    const aiOut = await aiInsertLogoCat({
+      userJpegBuf: userNorm,
+      logoPngBuf : logoBuf,
+      prompt     : FIXED_PROMPT,
+      size       : SIZE,
+    });
 
-    // 4) Fallback (guaranteed)
+    // 4) Fallback (guaranteed result)
     const finalOut = aiOut || await fallbackOverlay(userNorm, logoBuf, SIZE);
 
     await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
-      caption: aiOut ? 'Your logo-cat PFP 😺✨' : 'AI was shy — here’s a sticker version 😺✨'
+      caption: aiOut ? 'Your logo-cat PFP 😺✨' : 'AI was shy — here’s a sticker version 😺✨',
     });
   } catch (err) {
     console.error(err);
@@ -150,7 +238,8 @@ bot.on('message:photo', async (ctx) => {
   }
 });
 
-// ---------- webhook ----------
+/* ------------------------------- Webhook/HTTP ------------------------------ */
+
 const handler = webhookCallback(bot, 'express', {
   secretToken: TELEGRAM_SECRET_TOKEN || undefined,
 });
@@ -162,6 +251,6 @@ app.post('/webhook/tg', (req, res) => {
   return handler(req, res);
 });
 
-// health check
 app.get('/', (_, res) => res.send('OK'));
+
 app.listen(PORT, () => console.log('Bot listening on :' + PORT));
