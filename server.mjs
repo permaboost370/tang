@@ -282,7 +282,7 @@ bot.on('message:photo', async (ctx) => {
     }
 
     await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
-      caption: USE_OPENAI ? 'Here’s your blended logo-cat 😺✨' : 'Here’s your logo-cat 😺✨'
+      caption: USE_OPENAI ? 'Here’s your Tang PFP' : 'Here’s your logo-cat 😺✨'
     });
 
     try { await ctx.api.deleteMessage(ctx.chat.id, waitMsg.message_id); } catch {}
