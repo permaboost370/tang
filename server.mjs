@@ -1,55 +1,30 @@
 import 'dotenv/config';
 import { Bot } from 'grammy';
 import express from 'express';
-import fetch from 'node-fetch';
 import crypto from 'node:crypto';
 
 const { BOT_TOKEN, ADMIN_CHAT_ID, PORT = 3000 } = process.env;
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
 if (!ADMIN_CHAT_ID) throw new Error('Missing ADMIN_CHAT_ID (numeric)');
 
-// In-memory job store
-// token -> job
-// adminMessageId -> token
-const jobsByToken = new Map();
-const tokensByAdminMsgId = new Map();
+// ---- State ----
+const jobsByToken = new Map();          // token -> job
+const tokensByAdminMsgId = new Map();   // adminMessageId -> token
+const lastTokenByAdmin = new Map();     // adminChatId -> token
 
-// Utils
 function isAdminChat(id) {
   return String(id) === String(ADMIN_CHAT_ID);
 }
-function mkToken() {
-  return 'JOB-' + crypto.randomBytes(3).toString('hex').toUpperCase(); // e.g., JOB-58FA29
-}
+function mkToken() { return 'JOB-' + crypto.randomBytes(3).toString('hex').toUpperCase(); }
 function fmtUser(ctx) {
   const u = ctx.from || {};
   const name = [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || 'User';
   const at = u.username ? `@${u.username}` : `(id:${u.id})`;
   return { id: u.id, name, at };
 }
-async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-async function tgGetFileUrl(token, fileId) {
-  const meta = await fetchWithTimeout(
-    `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`,
-    {}, 15000
-  ).then(r => r.json());
-  const filePath = meta?.result?.file_path;
-  if (!filePath) throw new Error('Could not resolve file_path');
-  return `https://api.telegram.org/file/bot${token}/${filePath}`;
-}
 function getBestImageFileId(msg) {
-  if (msg?.photo?.length) return msg.photo[msg.photo.length - 1].file_id; // largest photo
-  if (msg?.document && (msg.document.mime_type || '').startsWith('image/')) {
-    return msg.document.file_id;
-  }
+  if (msg?.photo?.length) return msg.photo[msg.photo.length - 1].file_id; // largest
+  if (msg?.document && (msg.document.mime_type || '').startsWith('image/')) return msg.document.file_id;
   return null;
 }
 function extractTokenFromText(s) {
@@ -57,11 +32,13 @@ function extractTokenFromText(s) {
   const m = s.match(/\bJOB-[A-F0-9]{6}\b/i);
   return m ? m[0].toUpperCase() : null;
 }
+function listOpenTokens() {
+  return Array.from(jobsByToken.keys());
+}
 
-// Bot
 const bot = new Bot(BOT_TOKEN);
 
-// Verbose update logging
+// See every update that reaches the bot
 bot.use(async (ctx, next) => {
   const kind = ctx.update?.message ? 'message'
              : ctx.update?.edited_message ? 'edited_message'
@@ -69,14 +46,16 @@ bot.use(async (ctx, next) => {
   console.log('[update]', kind, {
     chat_id: ctx.chat?.id,
     from_id: ctx.from?.id,
-    isAdminChat: isAdminChat(ctx.chat?.id)
+    isAdminChat: isAdminChat(ctx.chat?.id),
+    hasPhoto: !!ctx.message?.photo,
+    hasDoc: !!ctx.message?.document
   });
   await next();
 });
 
-bot.catch(err => console.error('[bot.catch]', err));
+bot.catch((err) => console.error('[bot.catch]', err));
 
-// Commands
+// ----- Commands
 bot.command('start', async (ctx) => {
   await ctx.reply('Send me the photo you want turned into a PFP. You’ll get a DM here once it’s ready. 😺✨');
 });
@@ -89,87 +68,100 @@ bot.command('help', async (ctx) => {
 
 Admin:
 • /id — show this chat id
-• Reply to the job message with the finished image (photo or image file)
-• Or send a new image with the job token in the caption (e.g. JOB-XXXXXX)`
-  );
+• /list — show open job tokens
+• /deliver <token> — set sticky token for next image
+• Deliver by: reply to job, put token in caption, or /deliver then send image.`);
 });
 bot.command('id', async (ctx) => {
   await ctx.reply(`chat_id: ${ctx.chat.id}`);
 });
-
-// --------------------------- ADMIN HANDLERS (FIRST) ---------------------------
-// If you reply to a job message with photo/doc OR send a new image with token in caption.
-async function handleAdminMedia(ctx) {
+bot.command('list', async (ctx) => {
   if (!isAdminChat(ctx.chat.id)) return;
-
-  const msg = ctx.message;
-  const finishedFileId = getBestImageFileId(msg);
-  if (!finishedFileId) return; // not an image; ignore
-
-  // Prefer reply mapping
-  const reply = msg.reply_to_message;
-  if (reply) {
-    const token = tokensByAdminMsgId.get(reply.message_id);
-    if (token) {
-      await deliverToUser(ctx, token, finishedFileId);
-      return;
-    }
-  }
-
-  // Else try token in caption/text
-  const token = extractTokenFromText(msg.caption || msg.text || '');
-  if (token) {
-    await deliverToUser(ctx, token, finishedFileId);
-    return;
-  }
-
-  await ctx.reply('I couldn’t find a job. Please reply to the job message I sent, or include the job token (e.g. JOB-XXXXXX) in your caption.');
-  console.warn('[admin media without token/reply]');
-}
-
-// Admin: image as photo or image/* document
-bot.on('message:photo', handleAdminMedia);
-bot.on('message:document', handleAdminMedia);
-
-// Admin: text with token (helper)
-bot.on('message:text', async (ctx) => {
+  const tokens = listOpenTokens();
+  await ctx.reply(tokens.length ? `Open jobs:\n${tokens.map(t => '• ' + t).join('\n')}` : 'No open jobs 🎉');
+});
+bot.command('deliver', async (ctx) => {
   if (!isAdminChat(ctx.chat.id)) return;
-  const token = extractTokenFromText(ctx.message.text);
-  if (token) {
-    await ctx.reply(`Got token ${token}. Now reply with the finished image or send it in a new message with the token in caption.`);
-  }
+  const token = extractTokenFromText(ctx.message.text || '');
+  if (!token) return void ctx.reply('Usage: /deliver JOB-XXXXXX');
+  if (!jobsByToken.has(token)) return void ctx.reply(`Unknown token ${token}. Try /list.`);
+  lastTokenByAdmin.set(ctx.chat.id, token);
+  await ctx.reply(`Sticky token set to ${token}. Now send the image (no need to reply/caption).`);
 });
 
-// Delivery function
+// ---------------- ADMIN HANDLERS (FIRST) ----------------
 async function deliverToUser(ctx, token, finishedFileId) {
   const job = jobsByToken.get(token);
   if (!job) {
-    await ctx.reply(`Unknown job token: ${token}`);
-    console.warn('[unknown token]', token);
-    return;
+    console.warn('[deliver] unknown token', token);
+    return void ctx.reply(`Unknown job token: ${token}`);
   }
   try {
-    await ctx.api.sendPhoto(job.userChatId, finishedFileId, {
-      caption: `Your PFP is ready! 😺✨`
-    });
+    console.log('[deliver] sending to user', { token, userChatId: job.userChatId });
+    await ctx.api.sendPhoto(job.userChatId, finishedFileId, { caption: 'Your PFP is ready! 😺✨' });
     await ctx.reply(`✅ Delivered to ${job.username} (id:${job.userId}). [${token}]`);
     jobsByToken.delete(token);
     console.log('[delivered]', { token, to: job.userChatId, userId: job.userId });
   } catch (e) {
-    console.error('[deliver error]', e);
-    await ctx.reply('❌ Failed to deliver. User may have blocked the bot or never pressed Start.');
+    console.error('[deliver error -> sendPhoto to user failed]', e);
+    await ctx.reply('❌ Failed to deliver. Did the user start the bot? (They must have chatted with the bot at least once.)');
   }
 }
 
-// --------------------------- USER HANDLERS (SECOND) ---------------------------
-async function handleIncomingFromUser(ctx) {
-  if (isAdminChat(ctx.chat.id)) return; // do not process admin chat here
+async function handleAdminMedia(ctx) {
+  if (!isAdminChat(ctx.chat.id)) return;
 
+  const msg = ctx.message;
+  const fileId = getBestImageFileId(msg);
+  if (!fileId) return; // ignore non-image
+
+  // 1) Reply mapping
+  const reply = msg.reply_to_message;
+  if (reply) {
+    const token = tokensByAdminMsgId.get(reply.message_id);
+    if (token) return void deliverToUser(ctx, token, fileId);
+  }
+  // 2) Token in caption/text
+  const fromCaption = extractTokenFromText(msg.caption || msg.text || '');
+  if (fromCaption) return void deliverToUser(ctx, fromCaption, fileId);
+  // 3) Sticky token (/deliver)
+  const sticky = lastTokenByAdmin.get(ctx.chat.id);
+  if (sticky && jobsByToken.has(sticky)) {
+    lastTokenByAdmin.delete(ctx.chat.id);
+    return void deliverToUser(ctx, sticky, fileId);
+  }
+  // 4) If exactly one open job, auto-deliver
+  const open = listOpenTokens();
+  if (open.length === 1) return void deliverToUser(ctx, open[0], fileId);
+
+  console.warn('[admin media without token/reply]');
+  await ctx.reply('I couldn’t match this image to a job.\nReply to the job message, include JOB-XXXXXX in caption, or /list then /deliver JOB-XXXXXX.');
+}
+bot.on('message:photo', handleAdminMedia);
+bot.on('message:document', handleAdminMedia);
+
+// Also allow sending a token as plain text to set sticky
+bot.on('message:text', async (ctx) => {
+  if (!isAdminChat(ctx.chat.id)) return;
+  const token = extractTokenFromText(ctx.message.text);
+  if (token) {
+    if (!jobsByToken.has(token)) return void ctx.reply(`Unknown token ${token}. Try /list.`);
+    lastTokenByAdmin.set(ctx.chat.id, token);
+    await ctx.reply(`Got token ${token}. Now send the finished image (no need to reply).`);
+  }
+});
+
+// ---------------- USER HANDLERS (SECOND) ----------------
+async function handleIncomingFromUser(ctx) {
+  if (isAdminChat(ctx.chat.id)) return;
+
+  console.log('[user handler] got message in user chat', { chat: ctx.chat.id });
   const { id: userId, name, at } = fmtUser(ctx);
   const fileId = getBestImageFileId(ctx.message);
+
   if (!fileId) {
-    await ctx.reply('Please send a JPG/PNG as a photo or image file.');
-    return;
+    console.warn('[user handler] no image found in message');
+    return void ctx.reply('Please send a JPG/PNG as a photo or image file.');
   }
 
   await ctx.reply('Got it! Your PFP will be sent here soon. 😺');
@@ -180,25 +172,25 @@ From: ${name} ${at}
 user_id: ${userId}
 token: ${token}
 
-👉 Reply to this message with the finished image (photo or image file), OR send a new message that includes this token in the caption/text.`;
+👉 Deliver by:
+• Reply to this message with the finished image
+• OR include ${token} in the caption
+• OR /deliver ${token} then send the image`;
 
-  // Send to admin; not forwarding, so reply-to works reliably
-  const adminMsg = await ctx.api.sendPhoto(ADMIN_CHAT_ID, fileId, { caption });
-
-  jobsByToken.set(token, {
-    token,
-    userId,
-    username: at,
-    userChatId: ctx.chat.id,
-    userMsgId: ctx.message.message_id,
-    originalFileId: fileId
-  });
-  tokensByAdminMsgId.set(adminMsg.message_id, token);
-
-  console.log('[job created]', { token, adminMessageId: adminMsg.message_id, userChatId: ctx.chat.id, userId, username: at });
+  try {
+    console.log('[user handler] sending job to admin', { ADMIN_CHAT_ID, token });
+    const adminMsg = await ctx.api.sendPhoto(ADMIN_CHAT_ID, fileId, { caption });
+    // record job
+    jobsByToken.set(token, { token, userId, username: at, userChatId: ctx.chat.id, userMsgId: ctx.message.message_id, originalFileId: fileId });
+    tokensByAdminMsgId.set(adminMsg.message_id, token);
+    console.log('[job created]', { token, adminMessageId: adminMsg.message_id, userChatId: ctx.chat.id, userId, username: at });
+  } catch (e) {
+    console.error('[admin send error] Failed to DM admin chat. Check ADMIN_CHAT_ID & that the admin started the bot.', e);
+    await ctx.reply('Sorry, I could not notify the creator. Please try again later.');
+  }
 }
 
-// User image handlers (placed AFTER admin handlers so they don't swallow admin replies)
+// Accept both photo and image document from users
 bot.on('message:photo', handleIncomingFromUser);
 bot.on('message:document', async (ctx) => {
   const mime = ctx.message.document?.mime_type || '';
@@ -206,16 +198,16 @@ bot.on('message:document', async (ctx) => {
   await handleIncomingFromUser(ctx);
 });
 
-// ---------------------------- START + HEALTH ----------------------------
+// ---- Start & health ----
 bot.start();
 console.log('Bot started (polling). ADMIN_CHAT_ID:', ADMIN_CHAT_ID);
 
 (async () => {
   try {
-    await bot.api.sendMessage(ADMIN_CHAT_ID, '👋 Bot online. Reply to job messages or include JOB-XXXXXX token in captions to deliver.');
+    await bot.api.sendMessage(ADMIN_CHAT_ID, '👋 Bot online. You will receive job messages here. Use /list and /deliver JOB-XXXXXX as needed.');
     console.log('[startup ping] sent');
   } catch (e) {
-    console.error('[startup ping failed] Check ADMIN_CHAT_ID (must be numeric; chat must include the bot).', e);
+    console.error('[startup ping failed] ADMIN_CHAT_ID may be wrong or not a chat with this bot.', e);
   }
 })();
 
