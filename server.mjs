@@ -1,310 +1,138 @@
 // server.mjs
 import 'dotenv/config';
-import express from 'express';
-import fetch from 'node-fetch';
 import { Bot, InputFile } from 'grammy';
-import sharp from 'sharp';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
-import FormData from 'form-data';
+import express from 'express'; // optional "health check" server
+import fetch from 'node-fetch';
 
-/* ----------------------------- Global Handlers ---------------------------- */
-process.on('unhandledRejection', (reason) => console.error('[unhandledRejection]', reason));
-process.on('uncaughtException',  (err)    => console.error('[uncaughtException]', err));
+// ---- ENV ----
+const { BOT_TOKEN, ADMIN_CHAT_ID } = process.env;
+if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
+if (!ADMIN_CHAT_ID) throw new Error('Missing ADMIN_CHAT_ID (your personal Telegram chat id)');
 
-/* --------------------------------- ENV ----------------------------------- */
-const {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_SECRET_TOKEN,
-  LOGO_CAT_URL,
-  OPENAI_API_KEY,
-  PROVIDER = '',
-  OUTPUT_SIZE = '1024',
-  AI_INPUT_SIZE = '640',   // smaller canvas for fast placement/blending
-  PORT = 3000,
-} = process.env;
+// ---- Minimal persistence (in-memory + optional JSON snapshot) ----
+// Map adminMessageId -> job { userId, username, userChatId, userMsgId, fileId, caption }
+const jobs = new Map();
 
-if (!TELEGRAM_BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
-if (!LOGO_CAT_URL) throw new Error('Missing LOGO_CAT_URL');
+// Optional: save/load to a JSON file on start/stop (commented for simplicity)
+// const PERSIST_PATH = '/tmp/tang-jobs.json';
 
-const SIZE = parseInt(OUTPUT_SIZE, 10) || 1024;
-const AI_IN_SIZE = parseInt(AI_INPUT_SIZE, 10) || 640;
-const USE_OPENAI = (PROVIDER || '').toUpperCase() === 'OPENAI' && !!OPENAI_API_KEY;
+// ---- Init bot ----
+const bot = new Bot(BOT_TOKEN);
 
-const FIXED_PROMPT =
-`Blend and harmonize the mascot placed in this photo:
-- Keep the plush "logo-cat" mascot intact (no redraw, no recolor).
-- Match scene lighting and add/adjust a soft contact shadow so it feels grounded.
-- Clean edges and integrate slightly with surroundings for a natural look.
-- No extra text or logos. Photoreal output. Square PNG.`;
-
-/* ------------------------------- App Setup -------------------------------- */
-const app = express();
-// Telegram sends JSON updates
-app.use(express.json({ limit: '25mb' }));
-
-/* ------------------------------- Utilities -------------------------------- */
-async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
+// Helpers
+function fmtUser(ctx) {
+  const u = ctx.from || {};
+  const name = [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || 'User';
+  const at = u.username ? `@${u.username}` : `(id:${u.id})`;
+  return { id: u.id, name, at };
 }
 
-async function fetchBuffer(url, timeoutMs = 30000) {
-  const resp = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!resp.ok) throw new Error(`Failed to fetch buffer: ${resp.status} ${resp.statusText}`);
-  return Buffer.from(await resp.arrayBuffer());
+function isAdmin(chatId) {
+  return String(chatId) === String(ADMIN_CHAT_ID);
 }
 
-async function tgGetFileUrl(fileId) {
-  const meta = await fetchWithTimeout(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`,
-    {}, 15000
-  ).then(r => r.json());
-  const filePath = meta?.result?.file_path;
-  if (!filePath) throw new Error('Could not resolve Telegram file_path');
-  return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
-}
+// Commands
+bot.command('start', async (ctx) => {
+  await ctx.reply('Send me the photo you want turned into a PFP. You’ll get a DM here once it’s ready. 😺✨');
+});
 
-// Square-crop & resize
-async function normalizeToSquare(buf, size) {
-  const img = sharp(buf).rotate();
-  const meta = await img.metadata();
-  const w = meta.width || size, h = meta.height || size;
-  const side = Math.min(w, h);
-  const left = Math.floor((w - side) / 2);
-  const top  = Math.floor((h - side) / 2);
-  return await img.extract({ left, top, width: side, height: side }).resize(size, size).png().toBuffer();
-}
+bot.command('help', async (ctx) => {
+  await ctx.reply(
+    `How it works:
+1) Send a photo here.
+2) I’ll notify the creator.
+3) You’ll receive your finished PFP in this chat.
 
-// Load logo PNG (remote) with simple cache
-let _logoCache = null;
-async function getLogoBuffer() {
-  if (_logoCache) return _logoCache;
-  _logoCache = await fetchBuffer(LOGO_CAT_URL, 15000);
-  return _logoCache;
-}
+Admin-only: /id shows this chat id.`
+  );
+});
 
-// Deterministic-ish placement
-function pickCornerRotation(width, height) {
-  const corners = [
-    { name: 'tl', left: 0,        top: 0,         anchor: 'nw' },
-    { name: 'tr', left: width,    top: 0,         anchor: 'ne' },
-    { name: 'bl', left: 0,        top: height,    anchor: 'sw' },
-    { name: 'br', left: width,    top: height,    anchor: 'se' },
-  ];
-  const idx = Math.floor(Math.random() * corners.length);
-  const rot = (Math.random() * 14) - 7; // -7..+7 deg
-  return { ...corners[idx], rotation: rot };
-}
+bot.command('id', async (ctx) => {
+  await ctx.reply(`chat_id: ${ctx.chat.id}`);
+});
 
-async function placeMascotDraft(baseBuf, logoBuf, size) {
-  // scale mascot to ~28% of width
-  const scale = Math.max(0.22, Math.min(0.32, 0.28 + (Math.random() - 0.5) * 0.06));
-  const base = sharp(baseBuf).png();
-
-  const { width, height } = await base.metadata();
-  const logoW = Math.floor((width || size) * scale);
-
-  const logoResized = await sharp(logoBuf).resize({ width: logoW }).png().toBuffer();
-  const lrMeta = await sharp(logoResized).metadata();
-  const lrW = lrMeta.width || logoW;
-  const lrH = lrMeta.height || logoW;
-
-  const corner = pickCornerRotation(width || size, height || size);
-
-  const margin = Math.floor((width || size) * 0.05);
-  let left = margin, top = margin;
-  if (corner.name === 'tr') left = (width || size) - lrW - margin;
-  if (corner.name === 'br') { left = (width || size) - lrW - margin; top = (height || size) - lrH - margin; }
-  if (corner.name === 'bl') top = (height || size) - lrH - margin;
-
-  const rotated = await sharp(logoResized)
-    .rotate(corner.rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .png()
-    .toBuffer();
-
-  const rotMeta = await sharp(rotated).metadata();
-  const rw = rotMeta.width || lrW;
-  const rh = rotMeta.height || lrH;
-
-  // Soft shadow
-  const shadow = await sharp(rotated)
-    .linear(1, 0)
-    .modulate({ brightness: 0.2 })
-    .blur(4)
-    .png()
-    .toBuffer();
-
-  const composited = await sharp(baseBuf)
-    .composite([
-      { input: shadow, left, top },
-      { input: rotated, left, top },
-    ])
-    .png()
-    .toBuffer();
-
-  // Mask: solid except a transparent hole around mascot (+ padding)
-  const padPx = Math.floor(Math.max(rw, rh) * 0.06);
-  const rect = { left, top, w: rw, h: rh };
-
-  const mask = await sharp({
-    create: {
-      width: size,
-      height: size,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 1 } // keep region
-    }
-  }).png().toBuffer();
-
-  const hole = await sharp({
-    create: {
-      width: Math.max(1, rect.w + padPx * 2),
-      height: Math.max(1, rect.h + padPx * 2),
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 } // editable region
-    }
-  }).png().toBuffer();
-
-  const leftHole = Math.max(0, rect.left - padPx);
-  const topHole  = Math.max(0, rect.top  - padPx);
-
-  const finalMask = await sharp(mask)
-    .composite([{ input: hole, left: leftHole, top: topHole }])
-    .png()
-    .toBuffer();
-
-  return { composited, mask: finalMask };
-}
-
-/* --------------------------- OpenAI Images Edit --------------------------- */
-async function openaiBlendMascotHTTP({ draftPngBuf, maskPngBuf, prompt, size }) {
-  if (!USE_OPENAI) return null;
-
-  const form = new FormData();
-  form.append('model', 'gpt-image-1');
-  form.append('prompt', prompt);
-  form.append('size', `${size}x${size}`);
-  form.append('n', '1');
-  // form.append('response_format', 'b64_json'); // removed: not accepted
-  form.append('image', draftPngBuf, { filename: 'base.png', contentType: 'image/png' });
-  form.append('mask',  maskPngBuf,  { filename: 'mask.png', contentType: 'image/png' });
-
-  try {
-    const resp = await fetchWithTimeout('https://api.openai.com/v1/images/edits', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        ...form.getHeaders()
-      },
-      body: form
-    }, 30000);
-
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.warn('[OpenAI edits non-OK]', resp.status, text.slice(0, 1200));
-      return null;
-    }
-
-    const json = await resp.json();
-    const b64 = json?.data?.[0]?.b64_json;
-    if (!b64) {
-      console.warn('[OpenAI edits response]', JSON.stringify(json).slice(0, 1200));
-      return null;
-    }
-    const out = Buffer.from(b64, 'base64');
-    return await sharp(out).resize(size, size).png().toBuffer();
-  } catch (e) {
-    console.warn('[OpenAI edits error]', e?.response?.data || e?.message || e);
-    return null;
-  }
-}
-
-/* --------------------------------- Bot ------------------------------------ */
-const bot = new Bot(TELEGRAM_BOT_TOKEN);
-
+// User sends a photo (non-admin chats)
 bot.on('message:photo', async (ctx) => {
-  try {
-    const waitMsg = await ctx.reply('Working on your PFP…');
-
-    const photos = ctx.message.photo;
-    const fileId = photos?.[photos.length - 1]?.file_id;
-    if (!fileId) {
-      await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, 'Could not read that image. Try sending as a photo (not file).');
-      return;
-    }
-
-    // 1) Download + normalize
-    const fileUrl = await tgGetFileUrl(fileId);
-    const original = await fetchBuffer(fileUrl, 20000);
-
-    const [userNormAI, userNormOut, logoBuf] = await Promise.all([
-      normalizeToSquare(original, AI_IN_SIZE),
-      normalizeToSquare(original, SIZE),
-      getLogoBuffer()
-    ]);
-
-    // 2) Local draft + mask (AI size)
-    const { composited: draftFull, mask } = await placeMascotDraft(userNormAI, logoBuf, AI_IN_SIZE);
-
-    // 3) Try OpenAI blend (two short attempts), else fallback
-    let finalOut = null;
-    if (USE_OPENAI) {
-      const tryOnce = () => openaiBlendMascotHTTP({
-        draftPngBuf: draftFull, maskPngBuf: mask, prompt: FIXED_PROMPT, size: SIZE
-      });
-      const ai1 = await Promise.race([ tryOnce(), sleep(12000).then(() => null) ]);
-      finalOut = ai1;
-      if (!finalOut) {
-        await sleep(1000);
-        const ai2 = await Promise.race([ tryOnce(), sleep(8000).then(() => null) ]);
-        finalOut = ai2;
-      }
-    }
-
-    // 4) Fallback: high-res local sticker composite
-    if (!finalOut) {
-      const { composited } = await placeMascotDraft(userNormOut, logoBuf, SIZE);
-      finalOut = composited;
-    }
-
-    await ctx.replyWithPhoto(new InputFile(finalOut, 'pfp.png'), {
-      caption: USE_OPENAI ? 'Here’s your Tang PFP' : 'Here’s your logo-cat 😺✨'
-    });
-
-    try { await ctx.api.deleteMessage(ctx.chat.id, waitMsg.message_id); } catch {}
-    console.log('[webhook] done { openai:', USE_OPENAI, ' }');
-  } catch (err) {
-    console.error(err);
-    try { await ctx.reply('Sorry, something went wrong. Try another photo.'); } catch {}
+  const chatId = ctx.chat.id;
+  if (isAdmin(chatId)) {
+    // In admin chat, photos are handled below (as "deliver to user")
+    return;
   }
+
+  const { id: userId, name, at } = fmtUser(ctx);
+  const photos = ctx.message.photo;
+  const fileId = photos?.[photos.length - 1]?.file_id;
+  if (!fileId) {
+    await ctx.reply('Hmm, I couldn’t read that. Please send a photo (not a file).');
+    return;
+  }
+
+  // Acknowledge to user
+  await ctx.reply('Got it! Your PFP will be sent here soon. 😺');
+
+  // Forward to admin with user info and job instructions
+  const caption = `New PFP request:\nFrom: ${name} ${at}\nuser_id: ${userId}\n\n👉 Reply to this message with the finished image to deliver it back to the user.`;
+  const fwd = await ctx.api.sendPhoto(ADMIN_CHAT_ID, fileId, { caption });
+
+  // Record the job using the admin message id as the key
+  jobs.set(fwd.message_id, {
+    userId,
+    username: at,
+    userChatId: chatId,
+    userMsgId: ctx.message.message_id,
+    fileId,
+    captionFromUser: ctx.message.caption || '',
+  });
 });
 
-/* --------------------------- Early-ACK Webhook ---------------------------- */
-/**
- * We return 200 OK immediately so Telegram never retries,
- * then process the update in the background.
- */
-app.post('/webhook/tg', async (req, res) => {
-  // Optional: reject if a secret is configured and header mismatches
-  if (TELEGRAM_SECRET_TOKEN && req.get('x-telegram-bot-api-secret-token') !== TELEGRAM_SECRET_TOKEN) {
-    return res.status(401).send('Unauthorized');
-  }
-  // Acknowledge right away
-  res.status(200).send('OK');
+// Admin replies with the finished photo → bot sends it to the original user
+bot.on('message:photo', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return; // only handle admin chat here
 
-  try {
-    // Process asynchronously after response is closed
-    await bot.handleUpdate(req.body, req);
-  } catch (e) {
-    console.error('[handleUpdate error]', e);
+  const reply = ctx.message.reply_to_message;
+  if (!reply) return; // must be a reply to the bot's job message
+
+  const job = jobs.get(reply.message_id);
+  if (!job) return; // not a known job message
+
+  const finishedPhotos = ctx.message.photo;
+  const finishedFileId = finishedPhotos?.[finishedPhotos.length - 1]?.file_id;
+  if (!finishedFileId) {
+    await ctx.reply('I need a photo as a reply to the job message to deliver it.');
+    return;
   }
+
+  // Send to the original user
+  await ctx.api.sendPhoto(job.userChatId, finishedFileId, {
+    caption: `Your PFP is ready! 😺✨`,
+  });
+
+  // Optional: notify admin
+  await ctx.reply(`✅ Delivered to ${job.username} (id:${job.userId}).`);
+
+  // Cleanup the job
+  jobs.delete(reply.message_id);
 });
 
+// Admin can also send a text reply to communicate with the user via the bot (optional)
+bot.on('message:text', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  const reply = ctx.message.reply_to_message;
+  if (!reply) return;
+
+  const job = jobs.get(reply.message_id);
+  if (!job) return;
+
+  await bot.api.sendMessage(job.userChatId, `Message from the creator:\n${ctx.message.text}`);
+});
+
+// ---- Start long polling (no webhook timeouts) ----
+bot.start();
+console.log('Bot started with long polling.');
+
+// ---- Optional tiny HTTP server for Railway health checks ----
+const app = express();
 app.get('/', (_, res) => res.send('OK'));
-app.listen(PORT, () => console.log('Bot listening on :' + PORT));
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log('Health server on :' + port));
