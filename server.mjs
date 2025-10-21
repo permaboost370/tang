@@ -83,8 +83,7 @@ Delivery methods:
   await ctx.reply(
 `How it works:
 1) Send a photo here.
-2) The creator will edit it manually.
-3) You’ll receive your finished PFP back in this chat.` + extra
+2) You’ll receive your finished PFP back in this chat.` + extra
   );
 });
 
